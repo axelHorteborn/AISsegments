@@ -1,0 +1,102 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aissegments"
+version = "0.2.0"
+description = "AIS trajectory segmentation and feature-preserving compression for maritime traffic analysis."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Axel Hörteborn", email = "axel.horteborn@ri.se" },
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+]
+keywords = ["AIS", "maritime", "trajectory", "compression", "TDKC", "Douglas-Peucker", "segmentation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+[project.optional-dependencies]
+aisdb = ["aisdb>=1.0"]
+viz = ["matplotlib>=3.7"]
+dev = [
+    "pytest>=7",
+    "pytest-cov>=4",
+    "ruff>=0.5",
+    "matplotlib>=3.7",
+    "aisdb>=1.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/axelande/AISsegments"
+Repository = "https://github.com/axelande/AISsegments"
+Issues = "https://github.com/axelande/AISsegments/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aissegments"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/aissegments",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "CITATION.cff",
+    "pyproject.toml",
+]
+# Local AIS data files dropped under tests/data/ are kept out of the
+# distribution — they can be large (tens of MB) and may have third-party
+# attribution requirements that are easier to manage out-of-band.  The
+# directory's README.md is small and documents the format, so it stays in.
+exclude = [
+    "tests/data/*.csv",
+    "tests/data/*.csv.gz",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+]
+markers = [
+    "aisdb: integration tests that require the optional aisdb package and its bundled test data",
+    "local_csv: integration tests that need a CSV file dropped under tests/data/",
+]
+
+[tool.coverage.run]
+source = ["aissegments"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 100
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+    "pragma: no cover",
+]
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]  # line-length handled by formatter

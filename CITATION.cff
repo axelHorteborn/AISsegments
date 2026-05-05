@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+title: "AISsegments: AIS trajectory segmentation and feature-preserving compression"
+message: "If you use AISsegments in academic work, please cite both this software and the underlying TDKC algorithm paper."
+type: software
+authors:
+  - family-names: Hörteborn
+    given-names: Axel
+    email: axel.horteborn@ri.se
+    affiliation: "RISE Research Institutes of Sweden"
+license: MIT
+repository-code: "https://github.com/axelande/AISsegments"
+keywords:
+  - AIS
+  - maritime
+  - trajectory
+  - compression
+  - TDKC
+
+references:
+  - type: article
+    title: "An adaptive trajectory compression and feature preservation method for maritime traffic analysis"
+    authors:
+      - family-names: Guo
+        given-names: Shaoqing
+      - family-names: Bolbot
+        given-names: Victor
+      - family-names: Valdez Banda
+        given-names: Osiris
+    journal: "Ocean Engineering"
+    volume: 312
+    year: 2024
+    doi: "10.1016/j.oceaneng.2024.119189"
