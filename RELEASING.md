@@ -25,21 +25,24 @@ pending publisher** and fill in:
 | Field | Value |
 | --- | --- |
 | PyPI Project Name | `aissegments` |
-| Owner | `axelande`  *(GitHub username — NOT your PyPI login)* |
+| Owner | `axelHorteborn`  *(GitHub username — case matters)* |
 | Repository name | `AISsegments` |
 | Workflow name | `release.yml` |
 | Environment name | `pypi` for the PyPI entry, `testpypi` for the TestPyPI entry |
 
-Important: the **Owner** field is your **GitHub** username (`axelande`),
-not your PyPI login (`axelhorteborn`).  PyPI uses the GitHub repo URL,
-not your PyPI account name, to verify the OIDC token at publish time.
+The **Owner** field is the GitHub user/org under which the AISsegments
+repo lives — that's `axelHorteborn` (note the capital `H` to match the
+GitHub account exactly), separate from the `axelande` user that owns
+the OMRAT repo.  PyPI verifies the OIDC token's `repository_owner`
+claim against this value at publish time, so a typo here is the
+single most common cause of the dreaded `invalid-publisher` error.
 
 After saving, the entry shows as "pending" until the first publish lands.
 
 ### Optional: GitHub environments
 
 Create matching environments at
-`https://github.com/axelande/AISsegments/settings/environments`:
+`https://github.com/axelHorteborn/AISsegments/settings/environments`:
 
 - `pypi` — protected; recommended to require manual approval before deploy.
 - `testpypi` — typically unprotected.
@@ -80,7 +83,7 @@ single-maintainer repo.
    ```
 
 4. **Watch the workflow** at
-   `https://github.com/axelande/AISsegments/actions`.
+   `https://github.com/axelHorteborn/AISsegments/actions`.
    First run takes ~3 minutes (test + build + publish).  If the build job
    reports "Tag does not match pyproject.toml version", you forgot
    step 1.
@@ -118,10 +121,21 @@ git push origin v0.2.0
 
 ## Troubleshooting
 
-**"Trusted publisher rejected the request"** — the publisher entry on
-PyPI/TestPyPI didn't match.  Common causes: GitHub username mismatch
-(`axelande` vs `axelhorteborn` — see the "Owner" note above), workflow
-filename typo, environment name mismatch.
+**"Trusted publisher rejected the request"** / **`invalid-publisher`** —
+the publisher entry on PyPI/TestPyPI doesn't match what the OIDC token
+claims.  Open the failing workflow run, expand the "publish-..." job's
+log, and read the rendered claims; pay particular attention to:
+
+- `repository_owner` — must match the **Owner** field exactly (case
+  matters; `axelHorteborn` is *not* the same as `axelhorteborn` to
+  PyPI).
+- `workflow_ref` ends in `release.yml` — must match the **Workflow
+  name** field.
+- `environment` — must match the **Environment name** field
+  (`pypi` or `testpypi`).
+
+Edit the publisher entry in-place at `pypi.org/manage/account/publishing`
+to fix; no need to delete and recreate.
 
 **"403 Forbidden — invalid or non-existent authentication"** on a manual
 `twine upload` — your API token expired or was revoked.  Either issue a

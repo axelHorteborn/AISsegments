@@ -41,9 +41,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/axelande/AISsegments"
-Repository = "https://github.com/axelande/AISsegments"
-Issues = "https://github.com/axelande/AISsegments/issues"
+Homepage = "https://github.com/axelHorteborn/AISsegments"
+Repository = "https://github.com/axelHorteborn/AISsegments"
+Issues = "https://github.com/axelHorteborn/AISsegments/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aissegments"]

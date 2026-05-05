@@ -46,7 +46,7 @@ pip install "aissegments[aisdb]"
 For development with full test + coverage tooling:
 
 ```bash
-git clone https://github.com/axelande/AISsegments
+git clone https://github.com/axelHorteborn/AISsegments
 cd AISsegments
 pip install -e ".[dev,aisdb]"
 pytest --cov
