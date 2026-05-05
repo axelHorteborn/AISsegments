@@ -1,0 +1,108 @@
+name: release
+
+# Triggered by a version tag.
+#
+#   git tag v0.2.0          → publishes to PyPI
+#   git tag v0.2.0-rc1      → publishes to TestPyPI (dress rehearsal)
+#
+# Authentication is via PyPA's "trusted publisher" OIDC flow — no API
+# tokens are stored anywhere.  Both PyPI and TestPyPI must have a pending
+# publisher entry pointing at this repo + workflow filename.  See
+# RELEASING.md for the one-time setup.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. Belt-and-braces: run the test suite + lint before publishing, even
+  #    though CI already gated the commit.  Cheap insurance against
+  #    publishing a broken package.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install package + dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Test with coverage
+        run: pytest --cov
+
+  # 2. Build sdist + wheel, validate, upload as workflow artifact.
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip build twine
+      - name: Verify tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(python -c 'import tomllib, pathlib; \
+            print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if [ "${TAG_VERSION%-rc*}" != "${PKG_VERSION%rc*}" ] && \
+             [ "${TAG_VERSION}" != "${PKG_VERSION}" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match pyproject.toml version $PKG_VERSION"
+            exit 1
+          fi
+      - name: Build sdist + wheel
+        run: python -m build
+      - name: Validate distribution metadata
+        run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # 3. TestPyPI publication for prerelease tags (`v*-rc*`).
+  publish-testpypi:
+    needs: build
+    if: contains(github.ref, '-rc') || contains(github.ref, 'rc')
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/aissegments/
+    permissions:
+      id-token: write   # required for OIDC trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  # 4. Real PyPI publication for plain `v*` tags (no `-rc` suffix).
+  publish-pypi:
+    needs: build
+    if: ${{ !contains(github.ref, '-rc') && !contains(github.ref, 'rc') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/aissegments/
+    permissions:
+      id-token: write   # required for OIDC trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
