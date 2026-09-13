@@ -13,7 +13,7 @@ It is the reference Python implementation of the **Top-Down Kinematic Compressio
 1. **Shrink AIS data without losing the maritime-relevant features.** A continent-scale AIS feed easily produces hundreds of millions of position reports per month. Most of those points are uninformative — a vessel cruising in a straight line at a steady speed needs only its endpoints. TDKC keeps the points where vessels actually do something interesting (turn, accelerate, stop, manoeuvre) and drops the rest.
 2. **Treat AIS as a sequence of *kinematic states*, not just positions.** The classical Douglas-Peucker simplification looks only at how far points stray from a straight line. That throws away course and speed changes that lie on a straight track, which are exactly the events maritime risk analysis cares about. TDKC uses both position (Synchronous Euclidean Distance) **and** velocity (Synchronous Velocity Difference) with adaptive per-track thresholds.
 3. **Produce database-ready output.** The output isn't a smaller list of points — it's a list of `Segment` records with start/end coordinates, mean COG/SOG, and the count of original observations spanned. Each segment is a 2-point `LINESTRING` ready for `ST_Intersects` and other PostGIS operations.
-4. **Stay framework-neutral.** The core depends only on NumPy. AISdb is an optional adapter (`pip install "aissegments[aisdb]"`); other input paths (CSV from Marine Cadastre / institutional exports / your own pipeline) work via [`read_csv_tracks`](src/aissegments/adapters.py) without any extra dependencies.
+4. **Stay framework-neutral.** The core depends only on NumPy. AISdb is an optional adapter (`pip install "aissegments[aisdb]"`); CSV files from Marine Cadastre, the Danish Maritime Authority, institutional exports or your own pipeline work via [`read_csv_tracks`](src/aissegments/adapters.py) without any extra dependencies, and Parquet via [`read_parquet_tracks`](src/aissegments/parquet.py) with `pip install "aissegments[parquet]"`.
 
 ## Who is this for?
 
@@ -41,6 +41,9 @@ pip install aissegments
 
 # with the optional AISdb adapter for ingestion from raw NMEA / CSV
 pip install "aissegments[aisdb]"
+
+# with the optional streaming Parquet reader (pyarrow)
+pip install "aissegments[parquet]"
 ```
 
 For development with full test + coverage tooling:
@@ -51,6 +54,24 @@ cd AISsegments
 pip install -e ".[dev,aisdb]"
 pytest --cov
 ```
+
+### aisdb on Python 3.13+ (Windows)
+
+aisdb publishes Windows wheels only up to CPython 3.12. On a newer interpreter pip
+falls back to aisdb's source tarball, which fails immediately because it lists
+`patchelf` (a Linux-only tool) as an unconditional build requirement. The Rust
+extension itself compiles fine, so this repo ships a helper that downloads the
+sdist, patches its `pyproject.toml`, builds a wheel for your interpreter and
+installs it:
+
+```bash
+python tools/build_aisdb.py          # then: pip install -e ".[dev,aisdb]"
+```
+
+maturin fetches a temporary Rust toolchain by itself. The only local prerequisite is
+the MSVC linker, i.e. Visual Studio Build Tools with the "Desktop development with
+C++" workload. The build takes a few minutes the first time. If PyPI already has a
+wheel for your interpreter the script just installs that.
 
 ## Quickstart
 
@@ -96,13 +117,52 @@ with aisdb.SQLiteDBConn(dbpath="ais.db") as conn:
             ...  # write seg to your PostGIS table
 ```
 
+## Reading CSV and Parquet files
+
+The file readers recognise several provider layouts out of the box and expose the
+remaining knobs as keyword arguments, so a source that is not built in still works:
+
+| Layout | Time column | Transceiver class | Ship type | Dimensions |
+| --- | --- | --- | --- | --- |
+| Marine Cadastre | `BaseDateTime` ISO 8601 | `TransceiverClass` = `A` / `B` | `VesselType` numeric code | `Length` / `Width` (halved into offsets) |
+| DMA `aisdk` | `# Timestamp` `dd/mm/yyyy HH:MM:SS` | `Type of mobile` = `Class A` / `Class B` | `Ship type` decoded name | `A` / `B` / `C` / `D` offsets |
+| Generic | `time` as unix seconds or ISO 8601 | optional | numeric code | `dim_a`.. or `to_bow`.. |
+
+```python
+from aissegments import read_parquet_tracks, read_parquet_static_records, DEFAULT_SHIP_TYPE_NAMES
+
+# DMA and Marine Cadastre need no arguments.
+for track in read_parquet_tracks("aisdk-2025-01.parquet"):
+    ...
+
+# Other providers: override what differs.
+tracks = read_csv_tracks(
+    "feed.csv",
+    time_format="%Y.%m.%d %H-%M-%S",        # any strptime pattern
+    dayfirst=False,                        # for ambiguous mm/dd/yyyy strings
+    mobile_types=("A", "B", "Vessel"),     # or None to keep every row
+    skip_invalid=True,                     # drop rows with blank SOG/COG instead of raising
+)
+static = read_csv_static_records(
+    "feed.csv",
+    ship_type_names={**DEFAULT_SHIP_TYPE_NAMES, "cargo ship": 70},
+)
+```
+
+Both readers apply the same rules: the transceiver-class filter defaults to Class A and B
+(matched case-insensitively, with or without the word "Class") and warns if it drops every
+row, bare `A`/`B`/`C`/`D` columns are only treated as antenna offsets when all four are present,
+and non-informative cells such as `Undefined` or `Unknown` are skipped.
+
 ## What's in the package
 
 | Module | Purpose |
 | --- | --- |
 | [`aissegments.tdkc`](src/aissegments/tdkc.py) | TDKC algorithm: SED + SVD, Compression Binary Tree, adaptive thresholds, key-node identification |
 | [`aissegments._types`](src/aissegments/_types.py) | `Track` and `Segment` dataclasses, `to_segments` helper |
-| [`aissegments.adapters`](src/aissegments/adapters.py) | Input adapters: `from_aisdb_track`, `read_csv_tracks` (Marine Cadastre etc.), `read_csv_static_records` for vessel-info extraction |
+| [`aissegments.adapters`](src/aissegments/adapters.py) | Input adapters: `from_aisdb_track`, `read_csv_tracks`, `read_csv_static_records` for vessel-info extraction |
+| [`aissegments.parquet`](src/aissegments/parquet.py) | Streaming Parquet readers `read_parquet_tracks` / `read_parquet_static_records` (optional `pyarrow`) |
+| [`aissegments._schema`](src/aissegments/_schema.py) | Provider-layout knowledge shared by both readers: column aliases, transceiver classes, ship-type names, timestamp formats |
 
 ## Algorithm details
 

@@ -3,92 +3,52 @@
 - :func:`from_aisdb_track` — single AISdb track-dict → :class:`Track`.
 - :func:`read_csv_tracks` — generic CSV loader; groups by MMSI, returns one
   :class:`Track` per vessel.  Recognises common column name variants
-  (Marine Cadastre's ``BaseDateTime``/``LAT``/``LON``, etc.) and parses
-  ISO 8601 timestamps as well as unix seconds.  Handles ``.gz`` transparently.
+  (Marine Cadastre's ``BaseDateTime``/``LAT``/``LON``, DMA's
+  ``# Timestamp``, etc.) and parses ISO 8601, ``dd/mm/yyyy`` and unix
+  timestamps.  Handles ``.gz`` transparently.
 - :func:`read_csv_static_records` — companion to ``read_csv_tracks`` that
-  surfaces per-vessel static fields (VesselType, Length, Width, Draft,
+  surfaces per-vessel static fields (ship type, dimensions, draught,
   IMO, …) when the source CSV carries them.  Output is shaped to match
   AISdb's static-row dict so downstream consumers can treat aisdb-decoded
   data and rich-CSV data uniformly.
 
-None of these pull in extra runtime dependencies beyond ``numpy``.
+Column-layout knowledge is shared with the Parquet adapters through
+:mod:`aissegments._schema`.  None of these pull in extra runtime
+dependencies beyond ``numpy``.
 """
+
 from __future__ import annotations
 
 import csv
 import gzip
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from aissegments._schema import (
+    DEFAULT_MOBILE_TYPES,
+    MOBILE_ALIASES,
+    convert_static_value,
+    normalise_mobile_type,
+    parse_time_string,
+    resolve_column,
+    resolve_kinematics,
+    resolve_static,
+    split_length_width,
+    warn_if_mobile_filter_dropped_everything,
+)
 from aissegments._types import Track
 
-# Column aliases (all lower-cased before matching).  First element is the
-# canonical name used in error messages.
-_CSV_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
-    "mmsi": ("mmsi",),
-    "time": ("time", "basedatetime", "timestamp", "datetime", "date_time"),
-    "lon": ("lon", "longitude"),
-    "lat": ("lat", "latitude"),
-    "sog": ("sog", "speed"),
-    "cog": ("cog", "course"),
-}
 
-# Optional static-info columns recognised by :func:`read_csv_static_records`.
-# All aliases are matched lowercase.  Output keys mirror AISdb's static-row
-# dict so the same downstream code path can consume aisdb-decoded rows and
-# rich-CSV rows uniformly.
-_STATIC_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
-    "vessel_name": ("vesselname", "vessel_name", "name"),
-    "call_sign": ("callsign", "call_sign"),
-    "imo": ("imo", "imo_num"),
-    "ship_type": ("vesseltype", "ship_type", "shiptype"),
-    "destination": ("destination",),
-    # Source columns that get split into AISdb's per-quadrant antenna offsets.
-    "length": ("length", "loa", "ship_length"),
-    "width": ("width", "beam", "breadth"),
-    "draught": ("draft", "draught"),
-}
-
-
-def _resolve_csv_columns(fieldnames: list[str]) -> dict[str, str]:
-    """Map each canonical name to the actual header it found, or raise."""
-    lower_to_actual = {c.strip().lower(): c for c in fieldnames}
-    resolved: dict[str, str] = {}
-    missing: list[str] = []
-    for canonical, aliases in _CSV_COLUMN_ALIASES.items():
-        for alias in aliases:
-            if alias in lower_to_actual:
-                resolved[canonical] = lower_to_actual[alias]
-                break
-        else:
-            missing.append(canonical)
-    if missing:
-        raise KeyError(f"CSV missing required columns (any of these aliases): {missing}")
-    return resolved
-
-
-def _to_unix_seconds(value: str) -> float:
-    """Parse either a numeric unix-seconds timestamp or an ISO 8601 string.
-
-    Naive ISO timestamps are interpreted as UTC, the de-facto convention for
-    AIS data feeds.
-    """
-    s = value.strip()
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.timestamp()
+def _mobile_keep(mobile_types: tuple[str, ...] | None):
+    """Return ``cell -> bool`` for the transceiver-class filter (``None`` = keep all)."""
+    if mobile_types is None:
+        return None
+    wanted = {normalise_mobile_type(m) for m in mobile_types}
+    return lambda cell: normalise_mobile_type(cell) in wanted
 
 
 def _open_text_csv(path: Path):
@@ -144,7 +104,14 @@ def from_aisdb_track(track_dict: Mapping[str, Any]) -> Track:
     )
 
 
-def read_csv_tracks(path: Path | str) -> list[Track]:
+def read_csv_tracks(
+    path: Path | str,
+    *,
+    mobile_types: tuple[str, ...] | None = DEFAULT_MOBILE_TYPES,
+    time_format: str | None = None,
+    dayfirst: bool = True,
+    skip_invalid: bool = False,
+) -> list[Track]:
     """Load AIS pings from a CSV (optionally ``.gz``) and group them by MMSI.
 
     The header row must contain (in any order, case-insensitive) one
@@ -155,17 +122,21 @@ def read_csv_tracks(path: Path | str) -> list[Track]:
     | Field | Recognised header names                                          |
     |-------|------------------------------------------------------------------|
     | mmsi  | ``mmsi``                                                         |
-    | time  | ``time``, ``BaseDateTime``, ``timestamp``, ``datetime``, ``date_time`` |
+    | time  | ``time``, ``BaseDateTime``, ``timestamp``, ``# Timestamp``, ``datetime``, ``date_time`` |
     | lon   | ``lon``, ``longitude``, ``LON``                                  |
     | lat   | ``lat``, ``latitude``, ``LAT``                                   |
     | sog   | ``sog``, ``speed``                                               |
     | cog   | ``cog``, ``course``                                              |
 
-    Time values are accepted as either:
+    Time values are accepted as:
 
-    - Unix seconds (numeric, e.g. ``1625097600``), or
+    - Unix seconds (numeric, e.g. ``1625097600``),
     - ISO 8601 strings (e.g. ``2019-01-01T14:15:12``, ``...Z``, or
-      ``...+00:00``).  Naive timestamps are interpreted as UTC.
+      ``...+00:00``), or
+    - ``dd/mm/yyyy HH:MM:SS`` (``mm/dd`` with ``dayfirst=False``).
+
+    Naive timestamps are interpreted as UTC.  Any other layout needs an
+    explicit ``time_format``.
 
     Rows are grouped by ``mmsi`` and sorted by time within each group, so
     the order of rows in the source file does not matter.
@@ -174,6 +145,21 @@ def read_csv_tracks(path: Path | str) -> list[Track]:
     ----------
     path : Path or str
         Path to a ``.csv`` or ``.csv.gz`` file.
+    mobile_types : tuple of str, optional
+        Transceiver classes to keep when a class column (``Type of mobile``,
+        ``TransceiverClass``, ...) is present.  Compared case-insensitively
+        with a leading ``"Class"`` ignored, so the default
+        ``("Class A", "Class B")`` keeps ``A``/``B`` too and drops base
+        stations and AtoN.  Pass ``None`` to keep every row.  A warning is
+        emitted if the filter removes every row of a non-empty file.
+    time_format : str, optional
+        strptime pattern for the time column.  Skips auto-detection.
+    dayfirst : bool
+        How to read ambiguous ``xx/xx/yyyy`` strings.
+    skip_invalid : bool
+        Drop rows with missing or non-numeric kinematic fields instead of
+        raising.  Useful for feeds where Class B or static-only rows leave
+        SOG/COG blank.
 
     Returns
     -------
@@ -186,29 +172,50 @@ def read_csv_tracks(path: Path | str) -> list[Track]:
     KeyError
         If a required column is missing from the header.
     ValueError
-        If the file is empty, or any required field is missing / non-numeric
-        / un-parseable.
+        If the file is empty, or (unless ``skip_invalid``) any required
+        field is missing / non-numeric / un-parseable.
     """
     path = Path(path)
     by_mmsi: dict[int, list[tuple[float, float, float, float, float]]] = defaultdict(list)
+    keep_mobile = _mobile_keep(mobile_types)
+    n_rows = n_mobile_kept = 0
 
     with _open_text_csv(path) as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             raise ValueError(f"Empty CSV (no header row): {path}")
-        col_map = _resolve_csv_columns(list(reader.fieldnames))
+        names = list(reader.fieldnames)
+        col_map = resolve_kinematics(names, what="CSV")
+        mobile_col = resolve_column(names, MOBILE_ALIASES)
 
         for line_no, row in enumerate(reader, start=2):
+            n_rows += 1
+            if mobile_col is not None and keep_mobile is not None:
+                if not keep_mobile(row.get(mobile_col)):
+                    continue
+                n_mobile_kept += 1
             try:
                 mmsi = int(row[col_map["mmsi"]])
-                t = _to_unix_seconds(row[col_map["time"]])
+                t = parse_time_string(
+                    row[col_map["time"]], time_format=time_format, dayfirst=dayfirst
+                )
                 lon = float(row[col_map["lon"]])
                 lat = float(row[col_map["lat"]])
                 sog = float(row[col_map["sog"]])
                 cog = float(row[col_map["cog"]])
             except (TypeError, ValueError) as exc:
+                if skip_invalid:
+                    continue
                 raise ValueError(f"Invalid row {line_no} in {path}: {exc}") from exc
             by_mmsi[mmsi].append((t, lon, lat, sog, cog))
+
+    warn_if_mobile_filter_dropped_everything(
+        n_rows=n_rows,
+        n_kept=n_mobile_kept,
+        mobile_col=mobile_col,
+        mobile_types=mobile_types,
+        path=path,
+    )
 
     tracks: list[Track] = []
     for mmsi, rows in by_mmsi.items():
@@ -228,54 +235,45 @@ def read_csv_tracks(path: Path | str) -> list[Track]:
     return tracks
 
 
-def _to_int_or_none(value: str) -> int | None:
-    """Parse a CSV cell as int, tolerating empties, whitespace, and floats."""
-    s = (value or "").strip()
-    if not s:
-        return None
-    try:
-        return int(float(s))
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_float_or_none(value: str) -> float | None:
-    s = (value or "").strip()
-    if not s:
-        return None
-    try:
-        return float(s)
-    except (TypeError, ValueError):
-        return None
-
-
-def read_csv_static_records(path: Path | str) -> dict[int, dict[str, Any]]:
-    """Extract per-MMSI static info from a CSV (e.g. Marine Cadastre).
+def read_csv_static_records(
+    path: Path | str,
+    *,
+    mobile_types: tuple[str, ...] | None = DEFAULT_MOBILE_TYPES,
+    time_format: str | None = None,
+    dayfirst: bool = True,
+    ship_type_names: Mapping[str, int] | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Extract per-MMSI static info from a CSV (Marine Cadastre, DMA aisdk, ...).
 
     The CSV must have ``mmsi`` and a recognised time column (see
     :func:`read_csv_tracks` for aliases).  Optional static columns are
     detected case-insensitively:
 
-    | Output key  | Recognised headers             |
-    |-------------|---------------------------------|
-    | vessel_name | ``VesselName``, ``name``        |
-    | call_sign   | ``CallSign``                    |
-    | imo         | ``IMO``, ``imo_num``            |
-    | ship_type   | ``VesselType``, ``ShipType``    |
-    | destination | ``Destination``                 |
-    | dim_bow / dim_stern | (split from ``Length`` / ``LOA``)  — half each |
-    | dim_port / dim_star | (split from ``Width`` / ``Beam``)  — half each |
-    | draught     | ``Draft``, ``Draught``          |
+    | Output key  | Recognised headers                                  |
+    |-------------|-----------------------------------------------------|
+    | vessel_name | ``VesselName``, ``name``                             |
+    | call_sign   | ``CallSign``                                         |
+    | imo         | ``IMO``, ``imo_num``                                 |
+    | ship_type   | ``VesselType``, ``ShipType``, ``Ship type``          |
+    | destination | ``Destination``                                      |
+    | dim_bow / dim_stern | ``dim_a``/``dim_b``, ``to_bow``/``to_stern``, or a full ``A``/``B``/``C``/``D`` set; else half of ``Length`` / ``LOA`` |
+    | dim_port / dim_star | ``dim_c``/``dim_d``, ``to_port``/``to_starboard``, or ``C``/``D``; else half of ``Width`` / ``Beam`` |
+    | draught     | ``Draft``, ``Draught``                               |
 
     Marine Cadastre publishes overall ``Length``/``Width`` rather than the
-    per-quadrant antenna offsets that AIS Type-5 carries.  The split is
-    halved into ``dim_bow``/``dim_stern`` (and similarly for width) — a
-    centred-antenna approximation, which is what most AIS feeds report
-    when the antenna position is unknown.
+    per-quadrant antenna offsets that AIS Type-5 carries; those are halved
+    into ``dim_bow``/``dim_stern`` (and similarly for width) as a
+    centred-antenna approximation.  True offsets win when present.
+
+    Ship types may be numeric codes or decoded names (``"Cargo"``); names
+    are mapped through ``ship_type_names`` (default
+    :data:`aissegments.DEFAULT_SHIP_TYPE_NAMES`) and unknown names are
+    skipped.  Non-numeric IMO cells (``"Unknown"``) are skipped.
 
     Multiple rows per MMSI are merged with **last non-NULL value wins per
     field**, and the latest ``time`` is recorded.  Returns ``{}`` if no
-    recognised static columns are present.
+    recognised static columns are present.  See :func:`read_csv_tracks`
+    for ``mobile_types``, ``time_format`` and ``dayfirst``.
 
     Output dict is shaped to match AISdb's static-row dict so the same
     downstream code (e.g. OMRAT's ``_ensure_static``/``_ensure_state``)
@@ -290,30 +288,34 @@ def read_csv_static_records(path: Path | str) -> dict[int, dict[str, Any]]:
     """
     path = Path(path)
     out: dict[int, dict[str, Any]] = {}
+    keep_mobile = _mobile_keep(mobile_types)
+    n_rows = n_mobile_kept = 0
 
     with _open_text_csv(path) as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             raise ValueError(f"Empty CSV (no header row): {path}")
-        kinematic_map = _resolve_csv_columns(list(reader.fieldnames))
-        # Build the static column map; absent columns are simply skipped.
-        lower_to_actual = {c.strip().lower(): c for c in reader.fieldnames}
-        static_map: dict[str, str] = {}
-        for canonical, aliases in _STATIC_COLUMN_ALIASES.items():
-            for alias in aliases:
-                if alias in lower_to_actual:
-                    static_map[canonical] = lower_to_actual[alias]
-                    break
+        names = list(reader.fieldnames)
+        kinematic_map = resolve_kinematics(names, what="CSV")
+        mobile_col = resolve_column(names, MOBILE_ALIASES)
+        static_map = resolve_static(names)
         if not static_map:
             return {}
 
         for row in reader:
+            n_rows += 1
+            if mobile_col is not None and keep_mobile is not None:
+                if not keep_mobile(row.get(mobile_col)):
+                    continue
+                n_mobile_kept += 1
             try:
                 mmsi = int(row[kinematic_map["mmsi"]])
             except (TypeError, ValueError, KeyError):
                 continue
             try:
-                t = _to_unix_seconds(row[kinematic_map["time"]])
+                t = parse_time_string(
+                    row[kinematic_map["time"]], time_format=time_format, dayfirst=dayfirst
+                )
             except (TypeError, ValueError, KeyError):
                 continue
 
@@ -323,32 +325,22 @@ def read_csv_static_records(path: Path | str) -> dict[int, dict[str, Any]]:
                 entry["time"] = t
 
             for canonical, src_col in static_map.items():
-                # csv.DictReader yields "" for missing/blank cells; the
-                # parsers below all return None for empty input so no
-                # explicit None-guard is needed here.
-                raw = row.get(src_col, "")
-                if canonical in ("imo", "ship_type"):
-                    val = _to_int_or_none(raw)
-                elif canonical in ("length", "width", "draught"):
-                    val = _to_float_or_none(raw)
-                else:
-                    s = str(raw).strip()
-                    val = s or None
+                # csv.DictReader yields "" for missing/blank cells;
+                # convert_static_value returns None for those.
+                raw = (row.get(src_col) or "").strip()
+                if not raw:
+                    continue
+                val = convert_static_value(canonical, raw, ship_type_names)
                 if val is not None:
                     entry[canonical] = val
 
-    # Convert overall Length / Width into AISdb's per-quadrant antenna
-    # offsets (halved — centred-antenna approximation).
+    warn_if_mobile_filter_dropped_everything(
+        n_rows=n_rows,
+        n_kept=n_mobile_kept,
+        mobile_col=mobile_col,
+        mobile_types=mobile_types,
+        path=path,
+    )
     for entry in out.values():
-        length = entry.pop("length", None)
-        width = entry.pop("width", None)
-        if length is not None:
-            half = length / 2.0
-            entry["dim_bow"] = half
-            entry["dim_stern"] = half
-        if width is not None:
-            half = width / 2.0
-            entry["dim_port"] = half
-            entry["dim_star"] = half
-
+        split_length_width(entry)
     return out
