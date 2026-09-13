@@ -84,6 +84,15 @@ class TestColumnResolution:
     def test_static_ship_type_space_alias(self):
         assert resolve_static(["Ship type"]) == {"ship_type": "Ship type"}
 
+    def test_static_all_explicit_dims_skip_letter_lookup(self):
+        m = resolve_static(["to_bow", "to_stern", "to_port", "to_starboard", "A"])
+        assert m == {
+            "dim_bow": "to_bow",
+            "dim_stern": "to_stern",
+            "dim_port": "to_port",
+            "dim_star": "to_starboard",
+        }
+
 
 class TestMobileTypeNormalisation:
     @pytest.mark.parametrize("raw", ["Class A", "class a", " CLASS A ", "A", "a", "ClassA"])
@@ -122,6 +131,7 @@ class TestTimeParsing:
 
 class TestStaticValues:
     def test_convert_static_value(self):
+        assert convert_static_value("imo", None) is None
         assert convert_static_value("imo", "9612325") == 9612325
         assert convert_static_value("imo", "Unknown") is None
         assert convert_static_value("ship_type", "Cargo") == 70
