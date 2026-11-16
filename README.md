@@ -24,6 +24,7 @@ It is the reference Python implementation of the **Top-Down Kinematic Compressio
 ## What it produces
 
 - `tdkc(track)` — same `Track` interface but with only the *key points* retained (typically 1-5% of the input, depending on track shape and threshold tuning).
+- `tdkc_indices(track)` — the same compression as a sorted array of the kept point indices, for callers that build their own output from the original arrays (bulk database loads).
 - `tdkc_segments(track)` — a list of `Segment` records, one per consecutive key-point pair, ready for direct insertion as PostGIS `LINESTRING(start_lon start_lat, end_lon end_lat)` geometries with `cog_mean`, `sog_mean`, and `n_points` (count of original AIS pings each segment represents).
 
 ## Why not just use Douglas-Peucker?

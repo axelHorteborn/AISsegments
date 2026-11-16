@@ -6,13 +6,15 @@ from itertools import pairwise
 import numpy as np
 import pytest
 
-from aissegments import Track, tdkc, tdkc_segments
+from aissegments import Track, tdkc, tdkc_indices, tdkc_segments
 from aissegments.tdkc import (
     _build_cbt,
     _collect_thresholds,
     _compute_sed_svd,
     _haversine_m,
     _identify_keys,
+    _key_indices_recursive,
+    _segment_sums,
     _zscore,
 )
 
@@ -317,3 +319,125 @@ class TestTdkcSegments:
         segs = tdkc_segments(l_shaped_track)
         assert segs[0].t_start == l_shaped_track.t[0]
         assert segs[-1].t_end == l_shaped_track.t[-1]
+
+
+# ---------------------------------------------------------------------------
+# Level-synchronous evaluation == node-by-node recursion
+# ---------------------------------------------------------------------------
+
+
+def _ais_like_track(seed: int, n: int) -> Track:
+    """Ship-like random track: course/speed random walk, GPS noise, stops,
+    whole-second timestamps with repeats, positions on the AIS 1/10000' grid."""
+    rng = np.random.default_rng(seed)
+    dt = rng.choice([0.0, 1.0, 2.0, 3.0, 6.0, 10.0, 30.0, 180.0], size=n - 1,
+                    p=[0.1, 0.1, 0.2, 0.2, 0.2, 0.1, 0.05, 0.05])
+    t = 1.7e9 + np.concatenate([[0.0], np.cumsum(dt)])
+    sog = np.clip(10.0 + np.cumsum(rng.normal(0.0, 0.3, n)), 0.0, 25.0)
+    sog[rng.random(n) < 0.1] = 0.0
+    cog = (90.0 + np.cumsum(rng.normal(0.0, 4.0, n))) % 360.0
+    step = sog * 0.514444 * np.concatenate([[0.0], dt])
+    north = np.cumsum(step * np.cos(np.deg2rad(cog))) + rng.normal(0.0, 5.0, n)
+    east = np.cumsum(step * np.sin(np.deg2rad(cog))) + rng.normal(0.0, 5.0, n)
+    lat = np.round((57.0 + north / 111_195.0) * 600_000.0) / 600_000.0
+    lon = np.round((11.0 + east / (111_195.0 * np.cos(np.deg2rad(57.0)))) * 600_000.0) / 600_000.0
+    return Track.from_arrays(mmsi=219000099, t=t, lon=lon, lat=lat, sog=np.round(sog, 1),
+                             cog=np.round(cog, 1))
+
+
+def _assert_same_keys(track: Track) -> None:
+    for floors in ((1.0, 0.01), (30.0, 0.3), (0.0, 0.0)):
+        np.testing.assert_array_equal(
+            tdkc_indices(track, min_sed_m=floors[0], min_svd_kn=floors[1]),
+            _key_indices_recursive(track, *floors),
+        )
+
+
+class TestSegmentSums:
+    def test_matches_numpy_sum_bit_for_bit(self):
+        """Every summation regime: < 8 values, 8-128 with and without a
+        remainder, and the halving above 128."""
+        rng = np.random.default_rng(7)
+        edge = [1, 2, 7, 8, 9, 15, 16, 17, 127, 128, 129, 130, 136, 255, 256, 257, 1000, 2049]
+        lens = np.array(edge + rng.integers(1, 3000, size=40).tolist())
+        total = int(lens.sum())
+        x = rng.random(total) * 10.0 ** rng.uniform(-3.0, 4.0, total)
+        offs = np.concatenate([[0], np.cumsum(lens)[:-1]])
+        got = _segment_sums(x, offs, lens)
+        want = np.array([x[o : o + k].sum() for o, k in zip(offs, lens, strict=True)])
+        np.testing.assert_array_equal(got, want)
+
+
+class TestLevelSynchronousMatchesRecursion:
+    """``tdkc_indices`` must return exactly the reference recursion's key points."""
+
+    @pytest.mark.parametrize("n", [3, 4, 9, 33, 130, 300, 1500])
+    @pytest.mark.parametrize("seed", [0, 1, 2, 3])
+    def test_ais_like_tracks(self, n: int, seed: int):
+        _assert_same_keys(_ais_like_track(seed, n))
+
+    def test_fixture_tracks(self, straight_track, l_shaped_track, speed_change_track):
+        for track in (straight_track, l_shaped_track, speed_change_track):
+            _assert_same_keys(track)
+
+    def test_vessel_at_berth(self):
+        """Long runs of identical positions and SOG 0 give constant SED / SVD
+        (zero standard deviation) inside many sub-trajectories."""
+        n = 400
+        rng = np.random.default_rng(11)
+        lon = np.full(n, 11.5)
+        lat = np.full(n, 57.2)
+        moved = rng.random(n) < 0.05
+        lon[moved] += 1.0 / 600_000.0
+        track = Track.from_arrays(mmsi=1, t=np.arange(n) * 180.0, lon=lon, lat=lat,
+                                  sog=np.zeros(n), cog=np.full(n, 360.0 - 0.1))
+        _assert_same_keys(track)
+
+    def test_runs_of_equal_timestamps(self):
+        """Sub-trajectories whose ends share a timestamp keep SED = SVD = 0,
+        next to normal ones in the same level."""
+        base = _ais_like_track(5, 200)
+        t = np.repeat(base.t[::4], 4)[: len(base)]
+        track = Track(mmsi=1, t=t, lon=base.lon, lat=base.lat, sog=base.sog, cog=base.cog)
+        _assert_same_keys(track)
+
+    def test_course_through_north(self):
+        n = 120
+        cog = (350.0 + np.arange(n) * 0.5) % 360.0
+        lat = 57.0 + np.cumsum(np.cos(np.deg2rad(cog))) * 1e-4
+        lon = 11.0 + np.cumsum(np.sin(np.deg2rad(cog))) * 1e-4
+        track = Track.from_arrays(mmsi=1, t=np.arange(n) * 10.0, lon=lon, lat=lat,
+                                  sog=np.full(n, 12.0), cog=cog)
+        _assert_same_keys(track)
+
+    def test_nan_speed_picks_the_same_split_as_argmax(self):
+        """np.argmax returns the first NaN; the batched arg-max must too."""
+        base = _ais_like_track(9, 80)
+        sog = base.sog.copy()
+        sog[[17, 50]] = np.nan
+        track = Track(mmsi=1, t=base.t, lon=base.lon, lat=base.lat, sog=sog, cog=base.cog)
+        _assert_same_keys(track)
+
+
+class TestTdkcIndices:
+    @pytest.mark.parametrize("n", [0, 1, 2])
+    def test_short_tracks_keep_every_index(self, n: int):
+        track = Track.from_arrays(mmsi=1, t=np.arange(n) * 60.0, lon=np.zeros(n),
+                                  lat=np.full(n, 55.0), sog=np.full(n, 10.0),
+                                  cog=np.full(n, 90.0))
+        np.testing.assert_array_equal(tdkc_indices(track), np.arange(n))
+
+    def test_tdkc_is_take_of_indices(self, l_shaped_track: Track):
+        idx = tdkc_indices(l_shaped_track)
+        out = tdkc(l_shaped_track)
+        np.testing.assert_array_equal(out.t, l_shaped_track.t[idx])
+        np.testing.assert_array_equal(out.lon, l_shaped_track.lon[idx])
+
+    def test_segments_run_between_consecutive_indices(self, l_shaped_track: Track):
+        idx = tdkc_indices(l_shaped_track)
+        segs = tdkc_segments(l_shaped_track)
+        assert len(segs) == len(idx) - 1
+        for seg, (a, b) in zip(segs, pairwise(idx.tolist()), strict=True):
+            assert seg.t_start == l_shaped_track.t[a]
+            assert seg.t_end == l_shaped_track.t[b]
+            assert seg.n_points == b - a + 1

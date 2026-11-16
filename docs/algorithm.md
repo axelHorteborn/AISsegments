@@ -59,7 +59,18 @@ A node is a *key node* if either of its measurements exceeds the corresponding t
 - Threshold collection: `O(N)`.
 - Key-node identification: `O(N)`.
 
-For pathological inputs the tree degenerates and the construction phase is `O(N²)`; recursion depth scales with tree depth so very long degenerate inputs may need an explicit `sys.setrecursionlimit()` bump.
+For pathological inputs the tree degenerates and the construction phase is `O(N²)`.
+
+### Level-by-level evaluation (since 0.4.0)
+
+The public functions build the tree breadth-first: all sub-trajectories of one tree level are evaluated together in a single set of numpy operations, instead of one Python call per node. Real AIS tracks have one node per point and a depth of roughly 40-150 levels, so this removes almost all of the per-node interpreter overhead (about 8x faster on DMA tracks) and there is no recursion-depth limit.
+
+The output is identical to the node-by-node recursion, which is kept in `aissegments.tdkc` as the reference (`_key_indices_recursive`) and compared against in the test suite:
+
+- SED, SVD and the z-scores use the same element-wise operations.
+- The per-sub-trajectory sums behind each z-score follow numpy's own pairwise summation order (`_segment_sums`). A plain `np.add.reduceat` adds in a different order, differs in the last bits, and can then pick the other of two near-equal split candidates.
+- The adaptive thresholds are the means of the node values in the recursion's pre-order.
+- The arg-max returns the first maximum, and the first NaN when there is one, exactly like `np.argmax`.
 
 ## Coordinates and units
 

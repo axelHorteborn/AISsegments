@@ -5,6 +5,7 @@ Public API:
 - :class:`Track` / :class:`Segment` — typed input/output containers.
 - :func:`to_segments` — pair consecutive points of a Track into Segment records.
 - :func:`tdkc` — Top-Down Kinematic Compression; returns a compressed Track.
+- :func:`tdkc_indices` — the same compression as an array of kept indices.
 - :func:`tdkc_segments` — convenience wrapper: TDKC plus segment construction
   with original-point-count enrichment.
 - :func:`read_parquet_tracks` / :func:`read_parquet_static_records` —
@@ -32,9 +33,9 @@ from aissegments.adapters import (
     read_csv_tracks,
 )
 from aissegments.parquet import read_parquet_static_records, read_parquet_tracks
-from aissegments.tdkc import tdkc, tdkc_segments
+from aissegments.tdkc import tdkc, tdkc_indices, tdkc_segments
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "DEFAULT_MOBILE_TYPES",
@@ -49,6 +50,7 @@ __all__ = [
     "read_parquet_tracks",
     "ship_type_to_toc",
     "tdkc",
+    "tdkc_indices",
     "tdkc_segments",
     "to_segments",
 ]
